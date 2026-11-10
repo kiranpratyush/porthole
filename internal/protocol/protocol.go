@@ -27,6 +27,7 @@ func (m Message) Valid() bool {
 type Message struct {
 	Type MsgType `json:"type"`
 	ID   uint64  `json:"id,omitempty"`
+	Name string  `json:"name,omitempty"`
 }
 
 func WriteFrame(writer io.Writer, m Message) error {

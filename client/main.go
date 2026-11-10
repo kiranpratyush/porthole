@@ -11,13 +11,14 @@ import (
 
 const ControlAddr = ":8081"
 const AppAddr = ":3000"
+const ClientDomainName = "abc"
 
 func connectAndRegister() (net.Conn, error) {
 	conn, err := net.Dial("tcp", "localhost"+ControlAddr)
 	if err != nil {
 		return nil, err
 	}
-	if err := protocol.WriteFrame(conn, protocol.Message{Type: protocol.TypeRegister}); err != nil {
+	if err := protocol.WriteFrame(conn, protocol.Message{Type: protocol.TypeRegister, Name: ClientDomainName}); err != nil {
 		conn.Close()
 		return nil, err
 	}

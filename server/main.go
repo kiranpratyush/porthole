@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"ngrok-clone/internal"
 	"ngrok-clone/internal/protocol"
 	"ngrok-clone/internal/tunnel"
+	"ngrok-clone/internal/utils"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +47,9 @@ func (r *registry) get(client string) *internal.Client {
 func (r *registry) register(name string, c *internal.Client) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(name) == 0 {
+		return false
+	}
 	if _, taken := r.clients[name]; taken {
 		return false
 	}
@@ -73,9 +81,6 @@ func (p *pendingMap) remove(id uint64) (chan net.Conn, bool) {
 	return ch, ok
 }
 
-// serve accepts connections on l and hands each one to handle in its own
-// goroutine. It returns only when the listener is closed or broken; transient
-// Accept errors (e.g. too many open files) are logged and retried after a pause.
 func serve(name string, l net.Listener, handle func(net.Conn)) error {
 	for {
 		con, err := l.Accept()
@@ -92,7 +97,30 @@ func serve(name string, l net.Listener, handle func(net.Conn)) error {
 }
 
 func (s *server) handleHostConnection(con net.Conn) {
-	c := s.clients.get(DefaultClient)
+	/* Here extract the header and get the client based on subdomain
+	 */
+	var buf bytes.Buffer
+	teeReader := bufio.NewReader(io.TeeReader(con, &buf))
+	req, err := http.ReadRequest(teeReader)
+	if err != nil {
+		log.Print("Could not parse request", err)
+		con.Close()
+		return
+	}
+	/* Extract the domain name here */
+	host := req.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	clientName, err := utils.ParseClientName(host)
+
+	if err != nil {
+		log.Printf("Failed to get subdomain from host %s with error %v", req.Host, err)
+		con.Close()
+		return
+
+	}
+	c := s.clients.get(clientName)
 	if c == nil {
 		con.Close()
 		return
@@ -115,19 +143,20 @@ func (s *server) handleHostConnection(con net.Conn) {
 		}
 		data = <-ch
 	}
-	tunnel.Pipe(con, data)
+	userConn := &tunnel.PrefixConn{Conn: con, R: io.MultiReader(&buf, con)}
+	tunnel.Pipe(userConn, data)
 
 }
 
-func (s *server) handleRegisterLoop(con net.Conn) {
+func (s *server) handleRegisterLoop(con net.Conn, clientName string) {
 	defer con.Close()
 
 	c := &internal.Client{Con: con}
-	if !s.clients.register(DefaultClient, c) {
+	if !s.clients.register(clientName, c) {
 		log.Println("a client is already registered, rejecting", con.RemoteAddr())
 		return
 	}
-	defer s.clients.remove(DefaultClient, c) // runs before Close (defers are LIFO)
+	defer s.clients.remove(clientName, c) // runs before Close (defers are LIFO)
 
 	if err := c.Send(protocol.Message{Type: protocol.TypeRegisterOK}); err != nil {
 		log.Println("sending REGISTER_OK:", err)
@@ -162,7 +191,7 @@ func (s *server) handleControlConnection(con net.Conn) {
 	}
 	switch m.Type {
 	case protocol.TypeRegister:
-		s.handleRegisterLoop(con)
+		s.handleRegisterLoop(con, m.Name)
 	case protocol.TypeProxyOK:
 		s.handleProxyOk(con, m.ID)
 	default:
