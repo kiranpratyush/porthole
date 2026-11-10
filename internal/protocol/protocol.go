@@ -21,7 +21,7 @@ const (
 
 func (m Message) Valid() bool {
 	validTypes := []MsgType{TypeRegister, TypeRegisterOK, TypeProxy, TypeProxyOK}
-	return !slices.Contains(validTypes, m.Type)
+	return slices.Contains(validTypes, m.Type)
 }
 
 type Message struct {

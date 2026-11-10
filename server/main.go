@@ -1,12 +1,16 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"ngrok-clone/internal"
 	"ngrok-clone/internal/protocol"
+	"ngrok-clone/internal/tunnel"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -26,7 +30,7 @@ type pendingMap struct {
 type server struct {
 	clients  *registry
 	pendings *pendingMap
-	nextID   atomic.Uint32
+	nextID   atomic.Uint64
 }
 
 func (r *registry) get(client string) *internal.Client {
@@ -69,21 +73,50 @@ func (p *pendingMap) remove(id uint64) (chan net.Conn, bool) {
 	return ch, ok
 }
 
-func (s *server) initiateControlListener() {
-	controlListener, err := net.Listen("tcp", ControlAddr)
-	if err != nil {
-		log.Fatal("Failed to start controller listener with error", err)
-	}
-	defer controlListener.Close()
-
+// serve accepts connections on l and hands each one to handle in its own
+// goroutine. It returns only when the listener is closed or broken; transient
+// Accept errors (e.g. too many open files) are logged and retried after a pause.
+func serve(name string, l net.Listener, handle func(net.Conn)) error {
 	for {
-		con, err := controlListener.Accept()
+		con, err := l.Accept()
 		if err != nil {
-			log.Println("Failed to accept a connection", con)
+			if errors.Is(err, net.ErrClosed) {
+				return fmt.Errorf("%s listener closed: %w", name, err)
+			}
+			log.Printf("%s: accept failed: %v", name, err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go s.handleControlConnection(con)
+		go handle(con)
 	}
+}
+
+func (s *server) handleHostConnection(con net.Conn) {
+	c := s.clients.get(DefaultClient)
+	if c == nil {
+		con.Close()
+		return
+	}
+	id := s.nextID.Add(1)
+	ch := s.pendings.add(id)
+	message := protocol.Message{Type: protocol.TypeProxy, ID: id}
+	if err := c.Send(message); err != nil {
+		s.pendings.remove(id)
+		con.Close()
+		return
+	}
+	var data net.Conn
+	select {
+	case data = <-ch:
+	case <-time.After(10 * time.Second):
+		if _, ok := s.pendings.remove(id); ok {
+			con.Close()
+			return
+		}
+		data = <-ch
+	}
+	tunnel.Pipe(con, data)
+
 }
 
 func (s *server) handleRegisterLoop(con net.Conn) {
@@ -139,32 +172,28 @@ func (s *server) handleControlConnection(con net.Conn) {
 }
 
 func main() {
-	server := &server{
-		clients: &registry{clients: make(map[string]*internal.Client)},
+	s := &server{
+		clients:  &registry{clients: make(map[string]*internal.Client)},
+		pendings: &pendingMap{m: make(map[uint64]chan net.Conn)},
 	}
+
+	// Open both listeners before starting any goroutines, so a bad port
+	// fails the program immediately.
 	hostListener, err := net.Listen("tcp", HostAddr)
 	if err != nil {
 		log.Fatal("host listener: ", err)
 	}
-	defer hostListener.Close()
+	controlListener, err := net.Listen("tcp", ControlAddr)
+	if err != nil {
+		log.Fatal("control listener: ", err)
+	}
+	log.Printf("listening: host %s, control %s", HostAddr, ControlAddr)
 
-	server.initiateControlListener()
+	// Buffered so the second loop can still send (and exit) after main stops reading.
+	errc := make(chan error, 2)
+	go func() { errc <- serve("host", hostListener, s.handleHostConnection) }()
+	go func() { errc <- serve("control", controlListener, s.handleControlConnection) }()
+
+	// Whichever accept loop stops first takes the whole server down.
+	log.Fatal(<-errc)
 }
-
-/* Write everything you need to do for server part
-
-I have to handle user
-I have to listen on the host address
-When a user connects get the connection
-increment the connection id in the server
-create a channel for that connection and put it in the pendings
-send the PROXY message to the client
-using select wait on the channel on two cases
-chan and on a timeout
-if a chan is hit then we get the conn pipe the conn with the current conn
-
-if the timeout occurs : try to delete the channel from the pending
-if the deletion is successful, then close the user connection
-if it is not successful, then the conn is available in the channel
-use that conn and pipe it
-then the session ends*/
